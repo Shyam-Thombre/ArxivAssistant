@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls \"C:\\\\Users\\\\thomb\\\\.claude\\\\plans\\\\\" 2>&1 | head -20)"
+    ]
+  }
+}

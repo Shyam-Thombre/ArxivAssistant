@@ -1,0 +1,61 @@
+# Personal AI Research Assistant — config
+#
+# API keys are loaded from environment variables (see .env.example):
+#   ANTHROPIC_API_KEY, OPENAI_API_KEY, OPENROUTER_API_KEY, EXA_API_KEY, TAVILY_API_KEY
+# Ollama base URL defaults to http://localhost:11434 (override with OLLAMA_BASE_URL).
+
+llm:
+  # Per-role provider/model mapping. Any role may use any provider.
+  # Providers: anthropic | openai | openrouter | ollama | local
+  # OpenRouter accepts any supported catalog slug, for example:
+  #   qa:       { provider: openrouter, model: anthropic/claude-sonnet-4.6 }
+  #   embedder: { provider: openrouter, model: openai/text-embedding-3-small }
+  roles:
+    orchestrator:  { provider: openrouter, model: nvidia/nemotron-3-ultra-550b-a55b:free }
+    qa:            { provider: openrouter, model: nvidia/nemotron-3-ultra-550b-a55b:free }
+    retrieval:     { provider: openrouter, model: google/gemma-4-26b-a4b:free }
+    curator_judge: { provider: openrouter, model: google/gemma-4-31b:free }
+    summarizer:    { provider: openrouter, model: qwen/qwen3.8-27b:free }
+    criteria:      { provider: openrouter, model: nvidia/nemotron-3-ultra-550b-a55b:free }
+    info_gatherer: { provider: openrouter, model: nvidia/nemotron-3-ultra-550b-a55b:free }
+    embedder:      { provider: openrouter, model: liquid/lfm-2.5-embedding-350m:free }
+    reranker:      { provider: openrouter, model: nvidia/llama-nemotron-rerank-vl-1b-v2:free }
+
+rag:
+  mode: vanilla          # vanilla | agentic
+  top_k: 8
+  history_turns: 4
+  hybrid:
+    dense_weight: 0.7
+    sparse_weight: 0.3
+  agentic:
+    max_iters: 3
+
+domains:
+  # Example:
+  - name: rag
+    arxiv_categories: [cs.CL, cs.IR]
+    venues: [ACL, EMNLP, NeurIPS]
+    seed_papers: []
+
+mcp:
+  servers: []
+  # Example:
+  # - name: arxiv
+  #   transport: stdio
+  #   command: ["uvx", "arxiv-mcp-server"]
+  # - name: web_search
+  #   transport: stdio
+  #   command: ["uvx", "exa-mcp-server"]
+
+storage:
+  qdrant_path: ./data/qdrant
+  sqlite_path: ./data/assistant.db
+  pdf_dir:     ./data/pdfs
+
+curation:
+  accept_threshold: 0.65   # LLM-judge score [0,1] above which a paper is ingested
+
+monitor:
+  enabled: false
+  interval_minutes: 360

@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.env
+.env.local
+data/
+*.db
+*.sqlite
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+dist/
+build/
+web/node_modules/
+assistant/web/static/
