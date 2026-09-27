@@ -45,7 +45,7 @@ These have named entry points or established extension points so future work is 
 
 Items explicitly discussed in the design brainstorm. Their status is recorded here so implemented work is not mistaken for backlog.
 
-1. **Local application: built.** FastAPI + React/Vite provides saved fixed-scope chat, citation drawers, library/topic/inbox workflows, feedback, PDF/arXiv ingestion, and serialized background jobs. `assistant serve --build` hosts the API and static app.
+1. **Local application: built.** FastAPI + React/Vite provides saved fixed-scope chat with automatic LLM-generated names, citation drawers, library/topic/inbox workflows, feedback, PDF/arXiv ingestion, and serialized background jobs. `assistant serve --build` hosts the API and static app. Placeholder chats are named from the first question after a successful answer; descriptive titles are preserved, and older unnamed chats are handled on their next successful reply rather than through a bulk backfill.
 2. **Deployment on a Raspberry Pi** (Pi 5 / 8GB, single-user). Architecture is already RPi-friendly (embedded Qdrant, SQLite, Ollama for local roles). Outstanding work:
    - **Heavy roles to API**: orchestrator / qa / curator_judge stay on Anthropic/OpenAI; only `embedder` (and optionally `summarizer`) stay local.
    - **Disable reranker** on RPi (CPU inference of bge-reranker-v2-m3 is too slow there).
@@ -58,6 +58,8 @@ Items explicitly discussed in the design brainstorm. Their status is recorded he
 4. **Memory-first behavior: partially built.** The implemented seven-layer model covers working state, episodic interactions, semantic paper knowledge, procedural criteria, saved conversations, curation decisions, and profile facts. Versioned criteria and feedback capture are built; feedback-biased retrieval and consolidation remain pending.
 5. **Local-vs-API choice via config.** Built. Per-role mapping is in place; switching any role is a single YAML line.
 6. **Vanilla vs agentic RAG via config.** Built. Toggle is `rag.mode`.
+7. **Library organization and removal: built.** Papers have manually selected New/Reviewing/Read status, a combinable status filter, an Interesting star, and a Favorites tab. New and existing papers default to New and unstarred; re-ingestion preserves user preferences. Confirmed removal deletes library metadata, chunks, and search vectors while retaining PDFs and saved chats. The paper detail pane no longer displays raw chunks under Sections; chat citation drawers remain available for retained sources.
+8. **Selective citation verification: built.** QA produces claim-level evidence, checks exact quotes against retrieved chunks, and runs a separate whole-claim support verifier before emitting paper citations. General explanations and other claims without accepted citations are marked LLM knowledge. Verification failures withhold citations; the configurable verifier runs within the existing QA node. This does not guarantee factual accuracy, and saved answers are not retroactively verified.
 
 ---
 
@@ -67,6 +69,7 @@ The list of "yes, eventually" items that didn't make MVP. Treat as a backlog, no
 
 ### RAG / quality
 
+- **Citation precision evaluation** with real configured models and a labeled set of supported, partially supported, irrelevant, and contradictory claim/passage pairs. Current unit tests prove verification gating and labeling behavior using mocked verdicts, not empirical citation accuracy.
 - **Qdrant native sparse vectors** to replace in-memory BM25 (scales beyond a few thousand chunks).
 - **HyDE-style query expansion** for very short questions.
 - **Citation graph traversal** during retrieval (jump from a cited chunk to chunks of cited papers).
@@ -91,7 +94,7 @@ The list of "yes, eventually" items that didn't make MVP. Treat as a backlog, no
 - **Dockerfile + compose** including Ollama.
 - **Systemd unit** for the monitor scheduler.
 - **Backup/export**: a single command that bundles SQLite + Qdrant + PDFs.
-- **Migrations**: SQLAlchemy + Alembic for schema evolution (currently `create_all` on every startup).
+- **Versioned migrations**: SQLAlchemy + Alembic for general schema evolution. Current lazy engine initialization uses `create_all` plus idempotent SQLite upgrades for the paper reading-status and favorite columns; it is not a general migration system.
 - **Tracing**: LangSmith or local OTel for agent step-level visibility.
 
 ### Memory
@@ -99,7 +102,7 @@ The list of "yes, eventually" items that didn't make MVP. Treat as a backlog, no
 - **Auto-promotion to profile facts** from repeated user behavior (consolidation job).
 - **Feedback-biased ranking** (see pending list).
 - **Conflict detection across paper claims** — flag chunks that contradict each other for the same question.
-- **Forget interface**: `assistant forget <chunk-id-or-paper-id>` for things the user wants out of memory.
+- **CLI / granular forget interface**: `assistant forget <chunk-id-or-paper-id>` remains pending. Whole-paper removal is built in the web Library; it does not erase saved chats or source PDFs, and individual-chunk removal is not exposed.
 
 ### Multi-agent
 
@@ -122,6 +125,11 @@ These came up in the brainstorm and were settled. Recording them here so future 
 - **Per-role LLM mapping over single-global or two-tier.** User picked it explicitly.
 - **LLM-judge curation with versioned criteria over embedding-similarity-to-seed-set.** User picked it explicitly.
 - **CLI plus a localhost FastAPI/React app.** The web layer is deliberately single-user, one-process, and without authentication.
+- **Persistent chat beside the workspace.** Library, Topics, and Inbox open to the left of chat with the majority of desktop content width and independent scrolling. Smaller screens stack the panes. Chat remains visible, and starting or selecting a conversation does not dismiss the workspace.
+- **Fixed conversation scope at creation.** New chat and history sit below the page tabs in the main sidebar. New chat opens a draft, and the composer selector chooses library, topic, or paper scope before the first message creates the conversation. Existing chats display their fixed scope with disabled controls. Scope limits library retrieval, not the model's general knowledge or MCP results.
+- **Manual reading preferences.** Reading status and Interesting stars are independent of ingestion status, do not change automatically, and survive re-ingestion. Favorites and status filters organize the Library view, not the chat's retrieval scope.
+- **Library removal is not a full memory purge.** Source PDFs and saved chats are retained. Citations to deleted chunks become unavailable rather than pointing to another source.
+- **Citation relevance over citation volume.** Do not require paper references for every claim. Paper citations must pass quote and support checks; uncited claims are explicitly labeled LLM knowledge, which is an attribution boundary rather than an assurance of truth.
 - **Single-user, no auth, no scalability concerns** for now.
 
 ---

@@ -26,7 +26,7 @@ assistant/
 
   agents/            # One file per node — all are real, some stubs are intentional
     orchestrator.py  # intent dispatch
-    qa.py            # answers w/ citations + JSON parse; detours through info_gatherer on low conf
+    qa.py            # claim generation + evidence verification; low-conf info_gatherer detour
     retrieval.py     # vanilla vs agentic, paper/topic scope, follow-up rewrite
     curator.py       # per-topic LLM judge; preserves accepted and rejected results
     ingestion.py     # delegates to rag.ingest.ingest_source
@@ -44,7 +44,7 @@ assistant/
     parser.py        # PyMuPDF + heuristic section detection -> ParsedPaper
     chunker.py       # section-aware chunking, 15% overlap
     embedder.py      # thin wrapper over LLMRouter.embeddings
-    retriever.py     # hybrid dense+BM25 with RRF fusion; BM25 cached & invalidated on ingest
+    retriever.py     # hybrid dense+BM25 with RRF fusion; cache invalidated on ingest/removal
     reranker.py      # optional cross-encoder via sentence-transformers (lazy import)
     agentic.py       # decompose -> retrieve -> critique loop -> rerank
     ingest.py        # end-to-end: source -> chunks -> embeddings -> stores
@@ -81,14 +81,24 @@ assistant/
 
 - **Never instantiate a model client directly.** Always go through `get_router().chat(role)` (or `.embeddings(role)` / `.reranker(role)`).
 - **Never hardcode a role name** outside of `config.yaml` and the call site. If you find yourself adding a new role, add it to the YAML's example block and to the per-role default in `config.yaml`.
-- Roles are arbitrary strings — `qa`, `retrieval`, `curator_judge`, `summarizer`, `criteria`, `info_gatherer`, `embedder`, `reranker`, `orchestrator` exist today. Add more by editing config; the router lazily resolves on first use.
+- Roles are arbitrary strings — `qa`, `citation_verifier`, `conversation_title`, `retrieval`, `curator_judge`, `summarizer`, `criteria`, `info_gatherer`, `embedder`, `reranker`, `orchestrator` exist today. Add more by editing config; the router lazily resolves on first use.
+
+### Answer attribution
+
+- QA generates validated, single-line claim blocks with per-claim source numbers and exact supporting quotes. General knowledge is allowed; do not force every claim to cite a paper.
+- A paper citation requires both quote occurrence in the retrieved chunk (whitespace-normalized) and a positive whole-claim verdict from a separate verifier call. The verifier uses `citation_verifier`, falling back to `qa` for older configs. It is a service call inside the existing QA node, not a new graph node.
+- The application renders citation markers only from verified evidence. Do not reintroduce raw model-supplied markers or trust a standalone citations list. Missing/invalid evidence and verifier failures must withhold citations.
+- Claims without accepted citations receive the `LLM knowledge` label. This means unverified against paper sources, not proven correct. External tool context and prior-turn citations are not evidence for current paper citations.
+- Keep the public `answer`, `citations` (chunk IDs), `confidence`, and `retrieved_chunks` contract unchanged. Run `python -m unittest discover -s tests -p test_qa.py -v` after citation-policy changes; the tests mock models and do not establish real-model citation accuracy.
 
 ### Storage
 
 - All DB access goes through `with session_scope() as s:` — never create sessions ad hoc.
 - Qdrant collections are created lazily on first insert (see `ensure_collection`). Don't pre-create them or assume a vector dimension. The first upsert sets it.
 - Embedded Qdrant calls must remain under the store's process lock because web chat and background jobs use different threads.
-- The BM25 index is in-memory and cached via `@lru_cache`. **Call `invalidate_bm25_cache()` after any operation that writes chunks** (the ingest path already does this — copy the pattern if you add another writer).
+- The BM25 index is in-memory and cached via `@lru_cache`. **Call `invalidate_bm25_cache()` after any operation that inserts, updates, or deletes chunks**, as ingestion and paper removal already do.
+- `Paper.reading_status` (`new`, `reviewing`, `read`) and `is_favorite` are user-controlled, separate from ingestion `status`. Defaults are `new` and `False`; re-ingestion must preserve both preferences.
+- Paper removal deletes the SQLite paper and its cascading chunks, calls `delete_paper_vectors()` for both Qdrant collections, and invalidates BM25 after the database commit. `delete_by_paper()` only removes chunk vectors and is still used by re-ingestion. Preserve source PDFs and saved chats.
 
 ### Config
 
@@ -105,16 +115,24 @@ assistant/
 
 - Run one server process because embedded Qdrant is process-local. Qdrant calls are protected by the store lock.
 - All `/api` writes require `X-Requested-With: assistant-ui`; keep localhost TrustedHost restrictions intact.
-- Conversations have a fixed scope. Load prior turns from the conversation store and pass them via `scratch.history`; do not reuse LangGraph state across turns.
+- Conversations have a fixed scope selected at creation. New chat in the main sidebar opens a draft; the composer dropdown chooses its scope before the first message creates the conversation. Existing conversations show disabled scope controls reflecting their saved scope. Load prior turns from the conversation store and pass them via `scratch.history`; do not reuse LangGraph state across turns.
+- Auto-name only chats still titled `New conversation`. `generate_conversation_title()` uses the first saved question and `conversation_title` (fallback `qa`), calls the model outside the database transaction, and conditionally updates the placeholder. Preserve descriptive titles and deleted chats. Emit the title as a `conversation` event after the final answer; failures must not discard the answer. Run `python -m unittest discover -s tests -p test_conversations.py -v` after naming changes.
+- Paper PATCH requests update only explicitly supplied fields (`model_fields_set`); changing a star or reading status must not clear the topic or reset other preferences.
 - Frontend source lives in `web/`; `npm run build` writes generated assets to `assistant/web/static/`.
 - The API streams chat events as NDJSON. Keep event shapes compatible with `web/src/api.ts`.
+- The UI must keep reading after `final` for the optional title update, update the matching sidebar item, and change the active header only if that same conversation is still selected.
+- Keep `ChatPage` mounted and visible in `Shell` beside the active Library, Topics, or Inbox workspace. Workspace changes refresh chat lists and scope pickers, not the pending transcript. Drafts, turns, and progress are keyed by conversation ID; stream callbacks must update their originating session and ignore deleted sessions. Do not overwrite cached turns with incomplete saved history or treat workspace navigation as a full page reload.
+- New chat, history selection, and paper/topic chat actions must preserve the open workspace. Only the workspace close button or Chat navigation returns to chat-only mode. Keep workspace drawers/dialogs inside their pane; use the stacked responsive layout on narrow screens rather than hiding chat.
+- `ChatPage` renders New chat and history into `Shell`'s persistent sidebar slot through a portal. Keep those controls available from other tabs, below the page navigation separator; do not restore a second conversation rail. Scope controls belong inside the composer, including before any conversation exists.
 - Background ingest and monitor jobs are intentionally serialized and in memory.
 
 ### Frontend
 
 - Run `npm run lint` and `npm run build` from `web/` after changes; the build includes TypeScript checking.
 - Run `npx prettier --check src/App.tsx src/api.ts` for the main frontend source files.
-- Preserve fixed conversation scope (`library`, `topic`, or `paper`) and resolve citation numbers through the API-provided `sources` array.
+- Preserve fixed conversation scope (`library`, `topic`, or `paper`). Library status and Favorites filters affect browsing, not chat retrieval scope.
+- Resolve citation `[n]` through `turn.citations[n - 1]`, then find the matching `chunk_id` in the API-provided `sources` array. Never index `sources` by citation number: deleted chunks are omitted. Disable citations whose source is unavailable.
+- The Library detail pane shows metadata and actions, not raw chunks or a Sections list. Keep chunk content available through chat citation drawers.
 
 ## Common tasks
 
@@ -169,6 +187,16 @@ assistant serve --build
 
 If embeddings fail, check Ollama is running (`ollama list`) or switch the `embedder` role to OpenAI.
 
+### Run library regression tests
+
+From the repository root, using the project's Python environment:
+
+```powershell
+python -m unittest discover -s tests -p test_library.py -v
+```
+
+The tests use temporary SQLite databases and in-memory Qdrant. They cover preferences, combined filters, write protection, database upgrades, re-ingestion, and deletion cleanup without touching the user's library.
+
 ## Gotchas
 
 - **`langgraph-checkpoint-sqlite` is required for state persistence.** If it's not installed, `graph.py` silently falls back to `MemorySaver`. That's fine for dev but loses state across runs.
@@ -176,7 +204,7 @@ If embeddings fail, check Ollama is running (`ollama list`) or switch the `embed
 - **Marker, the recommended better parser, is also not in deps** — it's heavy. PyMuPDF gets us to working end-to-end; swap when needed (see "Replace the PDF parser").
 - **Manual CLI ingest has no topic option.** The shared ingest function and web UI support topic attribution; a future CLI `--domain` flag can thread it through `scratch`.
 - **Web background jobs are in memory.** They are serialized but disappear on server restart.
-- **Schema changes use `create_all`, not migrations.** New tables are automatic; changing existing columns needs an explicit migration strategy.
+- **There is no general migration framework yet.** `get_engine()` lazily calls `create_all`, then adds missing `reading_status` and `is_favorite` columns with idempotent SQLite ALTER statements. Existing papers default to New and unstarred. Restart the API after upgrading; other changes to existing tables still need an explicit migration strategy.
 - **The BM25 index doesn't persist** — it's rebuilt per process from the SQLite chunks table. For very large libraries this becomes slow; the planned upgrade is Qdrant's native sparse vectors.
 - **`config.yaml` keys with no default in `AppConfig` will error on startup.** If you add an optional field, give it a `Field(default_factory=...)`.
 - **The QA -> info_gatherer detour can only fire once per invocation** (guarded by `state.did_gather`). Don't remove that guard or you'll loop.

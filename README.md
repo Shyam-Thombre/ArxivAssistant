@@ -67,11 +67,31 @@ assistant serve --build         # opens http://127.0.0.1:8000
 `assistant serve` runs one Uvicorn process on `127.0.0.1:8000`. Use `--build` after frontend changes; it installs `web/` dependencies when needed and builds into `assistant/web/static/`. The app provides:
 
 - fixed-scope, persisted conversations with numbered inline citations, source drawers, deletion, and feedback;
-- a searchable paper library with arXiv/PDF ingestion, topic assignment, and paper-scoped chat;
+- a searchable paper library with arXiv/PDF ingestion, topic assignment, manual New/Reviewing/Read status, status filtering, starred Favorites, removal, and paper-scoped chat;
 - topic status, topic-scoped chat, paper filtering, criteria refinement, and manual monitor runs;
 - a curation inbox for accepted, rejected, failed, ingested, and dismissed decisions.
 
+Chats created as "New conversation" receive a short LLM-generated name after their first successful answer. The name is based on the first user message, saved to SQLite, and streamed to the sidebar and chat header. Existing descriptive names are preserved; older unnamed chats are named on their next successful reply. Naming failures leave the answer intact and can retry on a later turn. The `conversation_title` role selects the naming model, with `qa` as a fallback for older configs.
+
+New chat and conversation history live in the main sidebar below the page tabs. Select Whole library, One topic, or One paper inside the message composer before sending the first message, which creates the conversation. Existing conversations display their fixed scope in the same controls; start a new chat to choose a different scope.
+
+Library, Topics, and Inbox open beside the always-visible conversation. On desktop, the workspace gets roughly 60% of the available content width and chat gets the rest, with independent scrolling. Narrow screens stack the workspace above chat while keeping the composer visible. Close the workspace pane or select Chat for a full-width conversation. Starting a chat, selecting history, or chatting about a paper/topic keeps the workspace open. Drafts and pending responses remain attached to their original conversation; a full page reload still does not resume an in-flight response, though completed turns remain saved.
+
 The API accepts write requests only with the UI's `X-Requested-With` header and rejects foreign Host headers. It is intentionally local and has no login.
+
+New papers start as New and unstarred. Reading status changes only when you select it; re-ingestion preserves status and favorites. Existing databases are upgraded automatically on startup, with existing papers defaulting to New and unstarred. Restart the API after upgrading.
+
+Removing a paper requires confirmation and removes its library entry, chunks, and search vectors. The original PDF and saved chats are retained; citations to removed chunks become unavailable. The paper detail pane shows metadata and actions, not raw retrieval chunks.
+
+### Answer attribution
+
+Paper citations are selective: general background does not need a paper reference. For each proposed citation, the answer model must provide an exact supporting quote from a retrieved chunk. The application checks that the quote occurs in that chunk (ignoring whitespace differences), then a separate verification call checks whether the evidence supports the entire claim. Only accepted references become numbered citations.
+
+Claims without an accepted paper citation are marked **LLM knowledge**, including general explanations and claims whose proposed evidence could not be verified. This label means the claim is not verified against a paper; it is not a guarantee of correctness. Answers can use general knowledge even when no paper chunks are retrieved. Unsupported paper-specific findings must not be invented.
+
+Web chat displays this attribution as a compact **LK** chip styled like numbered citations, with the full meaning in its tooltip. Confidence remains available internally but is not shown as a badge below answers.
+
+The verifier uses the `citation_verifier` role in `config.yaml`, falling back to `qa` when that role is absent. Verification adds one model call when candidate evidence exists. Invalid quotes, rejected evidence, and verification failures do not produce paper citations. Verification is model-based and can still make mistakes; stronger verifier models may improve accuracy. Existing saved answers are not re-verified automatically.
 
 For frontend development, run the API with `assistant serve --no-open` and then:
 
@@ -92,6 +112,8 @@ llm:
   roles:
     orchestrator:  { provider: anthropic, model: claude-sonnet-4-6 }
     qa:            { provider: anthropic, model: claude-sonnet-4-6 }
+    citation_verifier: { provider: anthropic, model: claude-sonnet-4-6 }
+    conversation_title: { provider: anthropic, model: claude-haiku-4-5 }
     retrieval:     { provider: anthropic, model: claude-haiku-4-5 }
     curator_judge: { provider: openai,    model: gpt-4o-mini }
     summarizer:    { provider: ollama,    model: qwen2.5:7b }

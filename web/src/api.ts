@@ -39,7 +39,8 @@ export type Paper = {
   domain?: string;
   accepted_score?: number;
   has_pdf: boolean;
-  sections?: { id: string; title: string; type: string; text: string }[];
+  reading_status: "new" | "reviewing" | "read";
+  is_favorite: boolean;
 };
 export type Topic = {
   name: string;

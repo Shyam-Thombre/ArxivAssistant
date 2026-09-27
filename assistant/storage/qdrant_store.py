@@ -124,6 +124,19 @@ def _build_filter(spec: dict[str, Any]) -> qm.Filter:
     )
 
 
+def delete_paper_vectors(paper_id: str) -> None:
+    with _CLIENT_LOCK:
+        delete_by_paper(paper_id)
+        client = get_client()
+        existing = {collection.name for collection in client.get_collections().collections}
+        if PAPERS_COLLECTION in existing:
+            client.delete(
+                collection_name=PAPERS_COLLECTION,
+                points_selector=qm.PointIdsList(points=[_point_id(PAPERS_COLLECTION, paper_id)]),
+                wait=True,
+            )
+
+
 def delete_by_paper(paper_id: str) -> None:
     """Remove all chunk vectors belonging to a paper."""
     with _CLIENT_LOCK:

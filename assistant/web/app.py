@@ -5,10 +5,10 @@ from __future__ import annotations
 import json
 import uuid
 from pathlib import Path
-from typing import Annotated, Iterator
+from typing import Annotated, Iterator, Literal
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlalchemy import func, or_, select
@@ -19,6 +19,7 @@ from assistant.memory.conversations import (
     conversation_history,
     create_conversation,
     delete_conversation,
+    generate_conversation_title,
     get_conversation,
     list_conversations,
 )
@@ -30,11 +31,14 @@ from assistant.memory.curation_store import (
 )
 from assistant.memory.episodic import set_feedback
 from assistant.rag.ingest import ingest_source
+from assistant.rag.retriever import invalidate_bm25_cache
 from assistant.storage import Chunk, Domain, Paper, session_scope
 from assistant.storage.domains import sync_domains_from_config
+from assistant.storage.qdrant_store import delete_paper_vectors
 from assistant.web.runner import invoke_graph, jobs, stream_graph
 
 _MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+ReadingStatus = Literal["new", "reviewing", "read"]
 
 
 class ConversationCreate(BaseModel):
@@ -56,8 +60,10 @@ class PaperAdd(BaseModel):
     domain: str | None = None
 
 
-class PaperTopicUpdate(BaseModel):
+class PaperUpdate(BaseModel):
     domain: str | None = None
+    reading_status: ReadingStatus = "new"
+    is_favorite: bool = False
 
 
 class CommentCreate(BaseModel):
@@ -99,9 +105,6 @@ def _paper_detail(paper_id: str) -> dict:
         if result is None:
             raise HTTPException(status_code=404, detail="Paper not found")
         paper, domain_name = result
-        chunks = session.execute(
-            select(Chunk).where(Chunk.paper_id == paper.id).order_by(Chunk.order)
-        ).scalars()
         return {
             "id": paper.id,
             "title": paper.title,
@@ -113,16 +116,9 @@ def _paper_detail(paper_id: str) -> dict:
             "domain": domain_name,
             "accepted_score": paper.accepted_score,
             "status": paper.status,
+            "reading_status": paper.reading_status,
+            "is_favorite": paper.is_favorite,
             "has_pdf": bool(paper.pdf_path),
-            "sections": [
-                {
-                    "id": chunk.id,
-                    "title": chunk.section_title or chunk.section_type,
-                    "type": chunk.section_type,
-                    "text": chunk.text,
-                }
-                for chunk in chunks
-            ],
         }
 
 
@@ -172,7 +168,12 @@ def create_app() -> FastAPI:
         return jobs.list()
 
     @app.get("/api/papers")
-    def api_papers(q: str | None = None, domain: str | None = None) -> list[dict]:
+    def api_papers(
+        q: str | None = None,
+        domain: str | None = None,
+        reading_status: ReadingStatus | None = None,
+        is_favorite: bool | None = None,
+    ) -> list[dict]:
         with session_scope() as session:
             query = select(Paper, Domain.name).outerjoin(Domain, Paper.domain_id == Domain.id)
             if q:
@@ -182,6 +183,10 @@ def create_app() -> FastAPI:
                 )
             if domain:
                 query = query.where(Domain.name == domain)
+            if reading_status:
+                query = query.where(Paper.reading_status == reading_status)
+            if is_favorite is not None:
+                query = query.where(Paper.is_favorite == is_favorite)
             rows = session.execute(query.order_by(Paper.created_at.desc())).all()
             return [
                 {
@@ -192,6 +197,8 @@ def create_app() -> FastAPI:
                     "arxiv_id": paper.arxiv_id,
                     "domain": domain_name,
                     "accepted_score": paper.accepted_score,
+                    "reading_status": paper.reading_status,
+                    "is_favorite": paper.is_favorite,
                     "has_pdf": bool(paper.pdf_path),
                 }
                 for paper, domain_name in rows
@@ -202,21 +209,37 @@ def create_app() -> FastAPI:
         return _paper_detail(paper_id)
 
     @app.patch("/api/papers/{paper_id}")
-    def api_update_paper(paper_id: str, body: PaperTopicUpdate) -> dict:
+    def api_update_paper(paper_id: str, body: PaperUpdate) -> dict:
         with session_scope() as session:
             paper = session.get(Paper, paper_id)
             if paper is None:
                 raise HTTPException(status_code=404, detail="Paper not found")
-            if body.domain:
-                domain = session.execute(
-                    select(Domain).where(Domain.name == body.domain)
-                ).scalar_one_or_none()
-                if domain is None:
-                    raise HTTPException(status_code=404, detail="Topic not found")
-                paper.domain_id = domain.id
-            else:
-                paper.domain_id = None
+            if "domain" in body.model_fields_set:
+                if body.domain:
+                    domain = session.execute(
+                        select(Domain).where(Domain.name == body.domain)
+                    ).scalar_one_or_none()
+                    if domain is None:
+                        raise HTTPException(status_code=404, detail="Topic not found")
+                    paper.domain_id = domain.id
+                else:
+                    paper.domain_id = None
+            if "reading_status" in body.model_fields_set:
+                paper.reading_status = body.reading_status
+            if "is_favorite" in body.model_fields_set:
+                paper.is_favorite = body.is_favorite
         return _paper_detail(paper_id)
+
+    @app.delete("/api/papers/{paper_id}", status_code=204)
+    def api_delete_paper(paper_id: str) -> Response:
+        with session_scope() as session:
+            paper = session.get(Paper, paper_id)
+            if paper is None:
+                raise HTTPException(status_code=404, detail="Paper not found")
+            delete_paper_vectors(paper_id)
+            session.delete(paper)
+        invalidate_bm25_cache()
+        return Response(status_code=204)
 
     @app.get("/api/papers/{paper_id}/pdf")
     def api_paper_pdf(paper_id: str):
@@ -447,6 +470,10 @@ def create_app() -> FastAPI:
                     )
                     event["result"] = result
                 yield json.dumps(event, ensure_ascii=True) + "\n"
+                if event.get("type") == "final":
+                    renamed = generate_conversation_title(conversation_id, question)
+                    if renamed is not None:
+                        yield json.dumps({"type": "conversation", "conversation": renamed}) + "\n"
 
         return StreamingResponse(output(), media_type="application/x-ndjson")
 

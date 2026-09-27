@@ -65,6 +65,8 @@ class Paper(Base):
     domain_id: Mapped[int | None] = mapped_column(ForeignKey("domains.id"), nullable=True)
     accepted_score: Mapped[float | None] = mapped_column(Float, nullable=True)
     status: Mapped[str] = mapped_column(String(16), default="ingested")
+    reading_status: Mapped[str] = mapped_column(String(16), default="new", server_default="new")
+    is_favorite: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
     extra: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
 

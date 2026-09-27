@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from functools import lru_cache
 from typing import Iterator
 
-from sqlalchemy import Engine, create_engine
+from sqlalchemy import Engine, create_engine, inspect
 from sqlalchemy.orm import Session, sessionmaker
 
 from assistant.config import get_config
@@ -23,6 +23,16 @@ def get_engine() -> Engine:
     url = f"sqlite:///{cfg.storage.sqlite_path.as_posix()}"
     engine = create_engine(url, future=True)
     Base.metadata.create_all(engine)
+    with engine.begin() as connection:
+        columns = {column["name"] for column in inspect(connection).get_columns("papers")}
+        if "reading_status" not in columns:
+            connection.exec_driver_sql(
+                "ALTER TABLE papers ADD COLUMN reading_status VARCHAR(16) NOT NULL DEFAULT 'new'"
+            )
+        if "is_favorite" not in columns:
+            connection.exec_driver_sql(
+                "ALTER TABLE papers ADD COLUMN is_favorite BOOLEAN NOT NULL DEFAULT 0"
+            )
     return engine
 
 

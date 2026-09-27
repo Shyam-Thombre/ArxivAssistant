@@ -35,7 +35,7 @@ This document describes how the AI Research Assistant is structured. For a user-
 
 - **Config-driven.** Provider/model per agent role, RAG mode, MCP servers, storage paths — all in `config.yaml`. No code change should be required to swap any LLM, switch RAG mode, or add an MCP tool.
 - **Single shared state.** A LangGraph `GraphState` TypedDict flows through every node. Each agent reads what it needs and writes the fields it owns — no other agent reaches into private state.
-- **Citations always.** The QA agent writes numbered inline markers while state and storage retain stable `chunk_id` citations. Every interaction is logged with those IDs.
+- **Selective, verified citations.** Numbered references require an exact supporting quote and a positive whole-claim verification verdict. Claims without accepted references are labeled `LLM knowledge`. State and storage retain stable `chunk_id` citations; model-based verification improves grounding but does not guarantee correctness.
 - **Versioned, never overwritten.** Curation criteria are append-only — every user comment becomes a new version, and the prior version remains queryable. Same idea will extend to profile facts later.
 - **Stubs are real nodes.** Every agent in the design lives in the LangGraph from day 1, even if it returns trivially. This keeps the topology stable and makes "deepening" any agent a localized change.
 
@@ -46,7 +46,7 @@ All agents are LangGraph nodes — callables taking `GraphState` and returning a
 | Node | File | Role |
 |---|---|---|
 | `orchestrator` | `agents/orchestrator.py` | Reads `state.intent`; routes to the right branch via a conditional edge. |
-| `qa` | `agents/qa.py` | Top-level QA. Ensures chunks are retrieved, prompts the QA LLM, parses JSON answer + citations + confidence. Detours through `info_gatherer` once when confidence is low. |
+| `qa` | `agents/qa.py` | Top-level QA. Retrieves chunks, generates structured claims and supporting quotes, verifies candidate evidence, and renders citations or LLM-knowledge labels. Detours through `info_gatherer` once when confidence is low. |
 | `retrieval` | `agents/retrieval.py` | Picks vanilla vs agentic RAG, resolves paper/topic scope, and rewrites follow-up queries. |
 | `curator` | `agents/curator.py` | LLM-as-judge over candidate abstracts. Loads criteria per candidate topic and preserves every decision. |
 | `ingestion` | `agents/ingestion.py` | Calls `rag.ingest.ingest_source()` for every source in state (single from CLI, list from curator output). |
@@ -101,7 +101,7 @@ Optional layer between hybrid retrieval and the QA prompt. Supports a local cros
 ### Vanilla (default)
 
 1. `Embedder.embed_query(question)` → dense Qdrant search → top-`candidate_k` chunks with text in payload.
-2. BM25 over all chunks in SQLite (`rank-bm25`, in-memory index, cached and invalidated on ingest) → top-`candidate_k`.
+2. BM25 over all chunks in SQLite (`rank-bm25`, in-memory index, cached and invalidated on ingest or paper removal) → top-`candidate_k`.
 3. Reciprocal Rank Fusion (`k=60`) merges the two lists.
 4. Reranker scores `(question, chunk_text)` pairs, returns top-`config.rag.top_k`.
 
@@ -113,7 +113,17 @@ Optional layer between hybrid retrieval and the QA prompt. Supports a local cros
 4. If gaps and `iter < max_iters`, loop with the new sub-queries.
 5. Final reranker pass against the original question → top-`top_k`.
 
-Both paths accept the same paper-ID scope. Topic scope resolves to paper IDs in SQLite, and sparse results are filtered as strictly as dense results. `qa_node` labels the final chunks `[1]..[n]`, includes recent saved turns, and maps answer markers back to chunk IDs.
+Both paths accept the same paper-ID scope. Topic scope resolves to paper IDs in SQLite, and sparse results are filtered as strictly as dense results. `qa_node` labels retrieved chunks `[1]..[n]` for the model and includes recent saved turns, but only accepted evidence becomes a citation in the final answer.
+
+### Claim attribution
+
+1. The `qa` model returns a validated JSON draft: `claims` with single-line Markdown `text` and `evidence` entries (`source`, `quote`), plus `confidence`. It may use general knowledge with an empty evidence list; no chunks is not an automatic refusal. The prompt forbids invented paper-specific findings.
+2. Candidate evidence must name an existing retrieved source and contain an exact quote found in that chunk after whitespace normalization. Nonexistent sources and fabricated quotations are discarded before verification.
+3. One separate chat call batches remaining claim/quote/passage candidates. The `citation_verifier` role (or `qa` if absent) judges whether each quoted passage supports the entire associated claim, rejecting mere topic overlap, partial support, and unsupported qualifications or numbers. Malformed, incomplete, duplicate, or failed verification responses withhold citations.
+4. Application code appends numbered markers only for accepted evidence, deduplicates chunk IDs in first-use order, and labels claims without accepted evidence `LLM knowledge`. Draft citation links are rejected and raw numeric markers are stripped. The public state and web response remain `answer`, `citations`, `confidence`, and `retrieved_chunks`.
+5. Rejected proposed evidence lowers confidence for the existing low-confidence detour. Intentionally uncited general knowledge alone does not lower confidence. An invalid draft produces a retry message without citations instead of bypassing verification.
+
+The verifier is part of the QA implementation, not an additional LangGraph node. It does not verify the truth of uncited knowledge, does not turn external tool summaries or prior-turn citations into paper evidence, and does not revisit saved answers. The exact-quote check is deterministic; semantic support remains an LLM judgment and needs real-model precision evaluation. `tests/test_qa.py` covers the verification and rendering contract with mocked model responses.
 
 ## Memory layers
 
@@ -136,13 +146,15 @@ Episodic writes happen in `memory_node` for `ask` intent. Feedback (`+1/0/-1`) i
 SQLAlchemy declarative models in `storage/schema.py`:
 
 - **Domain**: `name`, `arxiv_categories`, `venues`, `seed_papers`.
-- **Paper**: `id` (arxiv ID or hash), title, authors, abstract, venue, year, pdf_path, summary, `domain_id`, `accepted_score`, status, extra JSON.
+- **Paper**: `id` (arxiv ID or hash), title, authors, abstract, venue, year, pdf_path, summary, `domain_id`, `accepted_score`, ingestion `status`, user-controlled `reading_status` (`new`, `reviewing`, `read`), `is_favorite`, extra JSON.
 - **Chunk**: `id` (UUID matching Qdrant point), `paper_id`, `section_type` (abstract/intro/method/...), `section_title`, `order`, `text`, `char_start/end`.
 - **CriteriaVersion**: `domain_id`, `version` (per-domain monotonic), `structured_rules` JSON, `nl_addendum`, `source_comment`, `is_active`.
 - **Interaction**: `question`, `answer`, `cited_chunk_ids`, `rag_mode`, `confidence`, `user_feedback`, extra JSON.
 - **Conversation**: UUID, title, fixed scope type/target, timestamps.
 - **CurationDecision**: topic + base arXiv ID, paper metadata, score, reason, status, error.
 - **ProfileFact**: `key`, `value`, `source` (manual/consolidated).
+
+Reading status defaults to `new` and favorites to `False`. These preferences are independent of ingestion status and remain unchanged during re-ingestion. On first database access, `storage/sqlite_store.py:get_engine()` creates missing tables and adds missing preference columns with idempotent SQLite ALTER statements, backfilling existing papers to New and unstarred. There is no general versioned migration framework yet.
 
 Qdrant collections:
 
@@ -173,7 +185,7 @@ Vector dimensions are inferred from the first upsert (so the embedder can change
 2. **Parse.** `parser.parse_pdf()` uses PyMuPDF to extract text, then heuristically detects section headings to produce a `ParsedPaper` of `Section` objects with `section_type` (abstract / intro / method / experiments / results / conclusion / etc.).
 3. **Chunk.** `chunker.chunk_paper()` splits each section into ~1200-char chunks with 180-char overlap. Skips `references` and `acknowledgments`.
 4. **Embed.** Chunk vectors in a batch; paper-level vector from abstract (or title fallback).
-5. **Persist.** SQLite: upsert `Paper` + clear/rewrite `Chunk` rows for idempotency. Qdrant: upsert into `chunks` and `papers` collections (collections auto-created on first insert with the observed vector size).
+5. **Persist.** SQLite: upsert `Paper` + clear/rewrite `Chunk` rows for idempotency, preserving an existing paper's reading status and favorite flag. Qdrant: upsert into `chunks` and `papers` collections (collections auto-created on first insert with the observed vector size).
 6. **Invalidate BM25 cache** so newly-ingested chunks are searchable in the same process.
 
 ## MCP integration
@@ -190,16 +202,36 @@ The QA detour: when `qa_node` returns `confidence < rag.low_confidence_threshold
 
 `assistant/web/app.py` exposes the library, topics, inbox, jobs, conversations, feedback, PDF, and streaming chat routes. `runner.py` gives each graph request a fresh checkpointer thread ID, streams LangGraph custom progress events as NDJSON, and serializes ingest/monitor jobs through one worker. FastAPI serves the Vite build from `assistant/web/static`; frontend source lives in `web/`.
 
-The React app has four routed work surfaces:
+The React app presents a persistent Chat surface and three routed workspace panels:
 
-- **Chat** creates, loads, and deletes fixed-scope conversations; renders Markdown answers and clickable numbered citations; and records feedback.
-- **Library** searches and filters papers, queues arXiv/PDF ingestion, changes topic assignment, shows parsed sections, and starts paper-scoped chats.
+- **Chat** creates, loads, and deletes fixed-scope conversations; automatically names placeholder chats after a successful answer; renders Markdown answers and clickable numbered citations; and records feedback.
+- **Library** combines title/ID search, topic and reading-status filters, and All papers/Favorites tabs; queues arXiv/PDF ingestion; changes topic, reading status, and Interesting stars; removes papers with confirmation; and starts paper-scoped chats. The detail pane shows metadata and actions, not raw chunks or a Sections list.
 - **Topics** merges config and database topic state, syncs config, starts topic-scoped chats, filters the library, runs monitors, and refines criteria.
 - **Inbox** filters curator decisions and supports ingest, dismiss, and disagree/criteria-update actions.
 
-Chat uses `application/x-ndjson`: an initial conversation event, custom progress events (`retrieving`, `answering`, `gathering`), then a final result enriched with citation details and the persisted interaction ID. Conversations do not reuse LangGraph checkpoint state; earlier turns are loaded from SQLite into `scratch.history` for each fresh invocation.
+Chat uses `application/x-ndjson`: an initial conversation event, custom progress events (`retrieving`, `answering`, `gathering`), then a final result enriched with citation details and the persisted interaction ID. An optional second `conversation` event follows the answer when automatic naming succeeds; the frontend continues reading until the stream closes. Conversations do not reuse LangGraph checkpoint state; earlier turns are loaded from SQLite into `scratch.history` for each fresh invocation.
+
+`memory/conversations.py:generate_conversation_title()` names only rows still titled `New conversation`. It uses the earliest saved user question (or the current question if history is empty), invokes the `conversation_title` role with `qa` as a backward-compatible fallback, and stores a single-line title of at most 80 characters. The model call happens outside the transaction. A conditional update preserves a competing title change or deletion. Naming runs after the answer has been yielded, does not add a graph node, and never changes conversation scope. Failures retain the placeholder for retry on a later successful turn; existing descriptive titles are not regenerated. `tests/test_conversations.py` covers persistence, history, naming failures, concurrency, and streamed event order with mocked models.
+
+`Shell` keeps `ChatPage` mounted and visible in a persistent conversation pane. Library, Topics, and Inbox route into a separate workspace pane to its left, using a roughly 60/40 desktop split with a minimum chat width and independent scrolling. At narrow widths the panes stack while keeping the composer on-screen. Workspace drawers and dialogs stay within the workspace. A close button or Chat navigation restores chat-only mode; new-chat, history, and paper/topic chat actions retain the active workspace and update conversation selection separately.
+
+A portal places New chat and history in the main sidebar below a separator after the page tabs. Browser-local sessions retain drafts, turns, and progress by conversation ID, and each stream updates only its originating session. Workspace changes refresh conversation and scope-picker lists without replacing locally cached turns with incomplete saved history. This is browser-session state, not a durable stream-resumption mechanism across full page reloads.
+
+New chat starts an unsaved draft. Scope controls inside the message composer select library, topic, or paper scope; sending the first message creates the saved conversation with that scope. For an existing chat, the same controls are disabled and show its saved scope. Paper/topic chat actions elsewhere can still create scoped conversations directly. Library scope permits retrieval across all papers, topic scope resolves the topic's current paper IDs on each invocation, and paper scope selects one paper ID. Reading-status and Favorites filters only affect Library browsing. Scope constrains library retrieval, not the model's general knowledge or MCP tool results.
+
+Citation `[n]` resolves to `turn.citations[n - 1]`, then to the matching `chunk_id` in `sources`. The API omits deleted chunks from source details, so indexing `sources` by citation number would misattribute later citations. The UI disables unavailable citations while preserving saved answer text and access to remaining sources.
 
 Write routes require `X-Requested-With: assistant-ui`, and `TrustedHostMiddleware` accepts localhost only. Embedded Qdrant calls are guarded by a process lock, and `assistant serve` always runs one Uvicorn worker.
+
+### Paper library API
+
+These routes operate directly on storage; they do not invoke the agent graph:
+
+- `GET /api/papers` combines `q`, `domain`, `reading_status`, and `is_favorite` filters. List and detail responses include reading status and the favorite flag; detail responses no longer include a `sections` payload.
+- `PATCH /api/papers/{paper_id}` updates only supplied fields: `domain`, `reading_status`, and/or `is_favorite`. Omitted fields are preserved; an explicit null domain clears the topic. Invalid reading statuses or null preference values are rejected.
+- `DELETE /api/papers/{paper_id}` removes chunk and paper vectors under the Qdrant process lock using `delete_paper_vectors()`, then deletes the SQLite paper with cascading chunk deletion. After the database commit, it invalidates BM25 and returns 204. The separate `delete_by_paper()` helper only removes chunk vectors for re-ingestion. Source PDFs, saved conversations, interactions, and curation decisions are retained.
+
+`tests/test_library.py` exercises defaults, partial updates, combined filters, validation and write protection, deletion from both search indexes, failure handling, idempotent database upgrades, and preservation of preferences on re-ingestion and PDFs/chats on removal. Tests use temporary SQLite databases and in-memory Qdrant without model calls.
 
 ## Checkpointer
 

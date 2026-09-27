@@ -9,11 +9,15 @@ llm:
   # Providers: anthropic | openai | openrouter | ollama | local
   # OpenRouter accepts any supported catalog slug, for example:
   #   qa:       { provider: openrouter, model: anthropic/claude-sonnet-4.6 }
+  #   citation_verifier: { provider: openrouter, model: anthropic/claude-sonnet-4.6 }
+  #   conversation_title: { provider: openrouter, model: anthropic/claude-haiku-4.5 }
   #   embedder: { provider: openrouter, model: openai/text-embedding-3-small }
   roles:
     orchestrator:  { provider: openrouter, model: nvidia/nemotron-3-ultra-550b-a55b:free }
     qa:            { provider: openrouter, model: nvidia/nemotron-3-ultra-550b-a55b:free }
-    retrieval:     { provider: openrouter, model: google/gemma-4-26b-a4b:free }
+    citation_verifier: { provider: openrouter, model: nvidia/nemotron-3-ultra-550b-a55b:free }
+    conversation_title: { provider: openrouter, model: nvidia/nemotron-3-ultra-550b-a55b:free }
+    retrieval:     { provider: openrouter, model: nvidia/nemotron-3-ultra-550b-a55b:free }
     curator_judge: { provider: openrouter, model: google/gemma-4-31b:free }
     summarizer:    { provider: openrouter, model: qwen/qwen3.8-27b:free }
     criteria:      { provider: openrouter, model: nvidia/nemotron-3-ultra-550b-a55b:free }
